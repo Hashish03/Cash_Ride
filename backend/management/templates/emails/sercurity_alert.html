@@ -1,0 +1,60 @@
+SECURITY_ALERT_EMAIL_TEMPLATE = """
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <title>Security Alert</title>
+    <style>
+        body { font-family: Arial, sans-serif; margin: 0; padding: 20px; }
+        .container { max-width: 600px; margin: 0 auto; }
+        .header { background-color: #dc3545; color: white; padding: 20px; text-align: center; }
+        .content { padding: 20px; background-color: #f8f9fa; }
+        .alert { background-color: #f8d7da; border: 1px solid #f5c6cb; padding: 15px; border-radius: 4px; margin: 15px 0; }
+        .info-box { background-color: #d1ecf1; border: 1px solid #bee5eb; padding: 15px; border-radius: 4px; margin: 15px 0; }
+        .footer { padding: 20px; text-align: center; color: #666; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>🚨 Security Alert</h1>
+        </div>
+        <div class="content">
+            <h2>Hello {{ user.full_name|default:user.email }}!</h2>
+            
+            <div class="alert">
+                <strong>Security Event Detected:</strong> {{ alert_type }}
+            </div>
+            
+            {% if ip_address or device_info %}
+            <div class="info-box">
+                <h3>Event Details:</h3>
+                {% if ip_address %}
+                <p><strong>IP Address:</strong> {{ ip_address }}</p>
+                {% endif %}
+                {% if device_info %}
+                <p><strong>Device:</strong> {{ device_info.browser.family }} on {{ device_info.os.family }}</p>
+                {% endif %}
+                <p><strong>Time:</strong> {{ timestamp|default:"Just now" }}</p>
+            </div>
+            {% endif %}
+            
+            <h3>What should you do?</h3>
+            <ul>
+                <li>If this was you, no action is needed</li>
+                <li>If this wasn't you, change your password immediately</li>
+                <li>Review your recent account activity</li>
+                <li>Enable two-factor authentication if not already active</li>
+                <li>Contact support if you need assistance</li>
+            </ul>
+            
+            <p>We take your account security seriously and monitor for suspicious activity.</p>
+        </div>
+        <div class="footer">
+            <p>{{ app_name }} Security Team<br>
+            <a href="mailto:{{ support_email }}">{{ support_email }}</a></p>
+        </div>
+    </div>
+</body>
+</html>
+"""
