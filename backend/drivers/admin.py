@@ -3,6 +3,7 @@ from django.contrib.admin import ModelAdmin
 from .models import (DriverProfile, Vehicle)
 from documents.models import DriverDocument
 from earnings.models import DriverEarning
+from rating.models import DriverAvailability, DriverRating
 
 @admin.register(DriverProfile)
 class DriverProfileAdmin(admin.ModelAdmin):
@@ -33,7 +34,7 @@ class DriverEarningAdmin(admin.ModelAdmin):
     readonly_fields = ('created_at',)
 
 @admin.register(DriverAvailability)
-class DriverAvailabilityAdmin(GISModelAdmin):
+class DriverAvailabilityAdmin(admin.ModelAdmin):
     list_display = ('driver', 'is_available', 'last_online')
     list_filter = ('is_available',)
     search_fields = ('driver__user__email',)
