@@ -109,3 +109,81 @@ class RideEstimateSerializer(serializers.Serializer):
         if data['pickup_location'] == data['dropoff_location']:
             raise serializers.ValidationError("Pickup and dropoff locations cannot be the same")
         return data
+    
+# rides/serializers.py (additional serializers)
+
+class RideListSerializer(serializers.ModelSerializer):
+    """Serializer for ride list view"""
+    driver_name = serializers.SerializerMethodField()
+    rider_name = serializers.SerializerMethodField()
+    status_display = serializers.CharField(source='get_status_display')
+    
+    class Meta:
+        model = Ride
+        fields = [
+            'id', 'status', 'status_display', 'pickup_location', 'dropoff_location',
+            'total_fare', 'distance_km', 'duration_minutes', 'created_at', 'completed_at',
+            'driver_name', 'rider_name', 'payment_status'
+        ]
+    
+    def get_driver_name(self, obj):
+        if obj.driver:
+            return obj.driver.get_full_name() or obj.driver.email
+        return None
+    
+    def get_rider_name(self, obj):
+        return obj.rider.get_full_name() or obj.rider.email
+
+
+class RideCancelSerializer(serializers.Serializer):
+    """Serializer for ride cancellation"""
+    reason = serializers.ChoiceField(
+        choices=CancellationReason.objects.values_list('code', 'code'),
+        required=False
+    )
+    cancellation_note = serializers.CharField(max_length=500, required=False)
+    
+    def validate(self, data):
+        # Additional validation can be added here
+        return data
+
+
+class RidePaymentSerializer(serializers.Serializer):
+    """Serializer for ride payment"""
+    payment_method = serializers.ChoiceField(
+        choices=[
+            ('cash', 'Cash'),
+            ('card', 'Card'),
+            ('wallet', 'Wallet'),
+            ('paypal', 'PayPal')
+        ],
+        default='cash'
+    )
+    tip_amount = serializers.DecimalField(
+        max_digits=10,
+        decimal_places=2,
+        min_value=0,
+        required=False,
+        default=0
+    )
+    
+    def validate_tip_amount(self, value):
+        if value < 0:
+            raise serializers.ValidationError("Tip amount cannot be negative")
+        return value
+
+
+class DriverLocationSerializer(serializers.ModelSerializer):
+    """Serializer for driver location"""
+    last_updated = serializers.SerializerMethodField()
+    
+    class Meta:
+        model = DriverLocation
+        fields = [
+            'latitude', 'longitude', 'heading', 'speed',
+            'is_online', 'last_updated', 'accuracy'
+        ]
+        read_only_fields = ['last_updated']
+    
+    def get_last_updated(self, obj):
+        return obj.updated_at    

@@ -1,6 +1,6 @@
 from django.http import JsonResponse
 from django.conf import settings
-from backend.supabase import supabase
+from backend.cofig.supabase import supabase
 import jwt
 import logging
 

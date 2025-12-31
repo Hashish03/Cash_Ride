@@ -1,102 +1,231 @@
+# models.py for payments app
+
 from django.db import models
-from users.models import User
+from django.contrib.auth import get_user_model
 from django.core.validators import MinValueValidator
-from django.utils import timezone
+from decimal import Decimal
+
+User = get_user_model()
+
 
 class PaymentMethod(models.Model):
+    """Stores user's payment methods"""
     PAYMENT_TYPES = (
         ('card', 'Credit/Debit Card'),
+        ('bank', 'Bank Account'),
         ('wallet', 'Digital Wallet'),
-        ('bank', 'Bank Transfer'),
         ('cash', 'Cash'),
+        ('paypal', 'PayPal'),
+        ('upi', 'UPI'),
     )
     
     user = models.ForeignKey(User, on_delete=models.CASCADE, related_name='payment_methods')
-    payment_type = models.CharField(max_length=10, choices=PAYMENT_TYPES)
-    is_default = models.BooleanField(default=False)
-    created_at = models.DateTimeField(auto_now_add=True)
-    updated_at = models.DateTimeField(auto_now=True)
+    payment_type = models.CharField(max_length=20, choices=PAYMENT_TYPES)
+    is_primary = models.BooleanField(default=False)
+    is_verified = models.BooleanField(default=False)
     
-    # Card details (encrypted in production)
-    card_last4 = models.CharField(max_length=4, blank=True, null=True)
-    card_brand = models.CharField(max_length=20, blank=True, null=True)
-    card_exp_month = models.CharField(max_length=2, blank=True, null=True)
-    card_exp_year = models.CharField(max_length=4, blank=True, null=True)
+    # Generic fields that can store different payment method details
+    provider = models.CharField(max_length=50, blank=True)  # stripe, paypal, etc.
+    token = models.CharField(max_length=255, blank=True)  # Payment method token from gateway
+    last_four = models.CharField(max_length=4, blank=True)  # Last 4 digits of card/account
+    expiry_month = models.PositiveSmallIntegerField(null=True, blank=True)
+    expiry_year = models.PositiveSmallIntegerField(null=True, blank=True)
     
-    # Wallet details
-    wallet_provider = models.CharField(max_length=50, blank=True, null=True)
-    wallet_id = models.CharField(max_length=255, blank=True, null=True)
-    
-    # Bank details
-    bank_name = models.CharField(max_length=100, blank=True, null=True)
-    account_last4 = models.CharField(max_length=4, blank=True, null=True)
-    
-    class Meta:
-        ordering = ['-is_default', '-created_at']
-        verbose_name = 'Payment Method'
-        verbose_name_plural = 'Payment Methods'
-    
-    def __str__(self):
-        return f"{self.get_payment_type_display()} - {self.user.email}"
-
-class Transaction(models.Model):
-    STATUS_CHOICES = (
-        ('pending', 'Pending'),
-        ('completed', 'Completed'),
-        ('failed', 'Failed'),
-        ('refunded', 'Refunded'),
-        ('disputed', 'Disputed'),
-    )
-    
-    user = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, related_name='transactions')
-    payment_method = models.ForeignKey(PaymentMethod, on_delete=models.SET_NULL, null=True)
-    amount = models.DecimalField(max_digits=10, decimal_places=2, validators=[MinValueValidator(0)])
-    currency = models.CharField(max_length=3, default='USD')
-    status = models.CharField(max_length=10, choices=STATUS_CHOICES, default='pending')
-    transaction_id = models.CharField(max_length=100, unique=True)
-    description = models.TextField(blank=True, null=True)
     metadata = models.JSONField(default=dict, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
     
     class Meta:
+        ordering = ['-is_primary', '-created_at']
+        unique_together = ['user', 'token']  # Prevent duplicate tokens
+    
+    def __str__(self):
+        return f"{self.user.email} - {self.payment_type}"
+
+
+class Transaction(models.Model):
+    """Records all payment transactions"""
+    STATUS_CHOICES = (
+        ('pending', 'Pending'),
+        ('processing', 'Processing'),
+        ('completed', 'Completed'),
+        ('failed', 'Failed'),
+        ('cancelled', 'Cancelled'),
+        ('refunded', 'Refunded'),
+        ('partially_refunded', 'Partially Refunded'),
+    )
+    
+    GATEWAY_CHOICES = (
+        ('stripe', 'Stripe'),
+        ('paypal', 'PayPal'),
+        ('razorpay', 'Razorpay'),
+        ('square', 'Square'),
+        ('cash', 'Cash'),
+        ('wallet', 'Wallet'),
+    )
+    
+    user = models.ForeignKey(User, on_delete=models.CASCADE, related_name='transactions')
+    transaction_id = models.CharField(max_length=100, unique=True)
+    gateway = models.CharField(max_length=20, choices=GATEWAY_CHOICES)
+    payment_method_type = models.CharField(max_length=20)
+    
+    amount = models.DecimalField(
+        max_digits=12,
+        decimal_places=2,
+        validators=[MinValueValidator(Decimal('0.01'))]
+    )
+    currency = models.CharField(max_length=3, default='USD')
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='pending')
+    
+    description = models.TextField(blank=True)
+    metadata = models.JSONField(default=dict, blank=True)
+    
+    # Gateway-specific IDs
+    gateway_transaction_id = models.CharField(max_length=100, blank=True)
+    gateway_response = models.JSONField(null=True, blank=True)
+    
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    completed_at = models.DateTimeField(null=True, blank=True)
+    
+    class Meta:
         ordering = ['-created_at']
         indexes = [
             models.Index(fields=['transaction_id']),
-            models.Index(fields=['user', 'status']),
+            models.Index(fields=['user', 'created_at']),
+            models.Index(fields=['status', 'created_at']),
+            models.Index(fields=['gateway', 'created_at']),
         ]
     
     def __str__(self):
-        return f"{self.transaction_id} - {self.amount} {self.currency}"
+        return f"{self.transaction_id} - {self.amount} {self.currency} - {self.status}"
+    
+    @property
+    def is_successful(self):
+        return self.status in ['completed', 'refunded', 'partially_refunded']
+    
+    @property
+    def can_refund(self):
+        return self.status == 'completed' and self.amount > Decimal('0.00')
+
+
+class Refund(models.Model):
+    """Records refunds for transactions"""
+    STATUS_CHOICES = (
+        ('pending', 'Pending'),
+        ('processing', 'Processing'),
+        ('completed', 'Completed'),
+        ('failed', 'Failed'),
+    )
+    
+    transaction = models.ForeignKey(Transaction, on_delete=models.CASCADE, related_name='refunds')
+    refund_id = models.CharField(max_length=100, unique=True)
+    amount = models.DecimalField(max_digits=12, decimal_places=2)
+    currency = models.CharField(max_length=3, default='USD')
+    reason = models.TextField()
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='pending')
+    
+    gateway_refund_id = models.CharField(max_length=100, blank=True)
+    metadata = models.JSONField(default=dict, blank=True)
+    
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    completed_at = models.DateTimeField(null=True, blank=True)
+    
+    class Meta:
+        ordering = ['-created_at']
+    
+    def __str__(self):
+        return f"Refund {self.refund_id} - {self.amount} {self.currency}"
+
 
 class Wallet(models.Model):
+    """Digital wallet for users"""
     user = models.OneToOneField(User, on_delete=models.CASCADE, related_name='wallet')
-    balance = models.DecimalField(max_digits=10, decimal_places=2, default=0)
-    currency = models.CharField(max_length=3, default='USD')
+    balance = models.DecimalField(
+        max_digits=12,
+        decimal_places=2,
+        default=Decimal('0.00'),
+        validators=[MinValueValidator(Decimal('0.00'))]
+    )
+    
+    # Wallet settings
+    is_active = models.BooleanField(default=True)
+    auto_reload = models.BooleanField(default=False)
+    auto_reload_amount = models.DecimalField(
+        max_digits=12,
+        decimal_places=2,
+        null=True,
+        blank=True
+    )
+    auto_reload_threshold = models.DecimalField(
+        max_digits=12,
+        decimal_places=2,
+        null=True,
+        blank=True
+    )
+    
+    metadata = models.JSONField(default=dict, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
     
     def __str__(self):
-        return f"Wallet - {self.user.email}"
+        return f"{self.user.email} - {self.balance} {settings.DEFAULT_CURRENCY}"
+    
+    def can_pay(self, amount):
+        return self.balance >= amount and self.is_active
+    
+    def add_funds(self, amount, description="Deposit"):
+        """Add funds to wallet"""
+        self.balance += amount
+        self.save()
+        
+        # Record transaction
+        self.transactions.create(
+            transaction_type='credit',
+            amount=amount,
+            description=description,
+            balance_after=self.balance
+        )
+        return self.balance
+    
+    def deduct_funds(self, amount, description="Payment"):
+        """Deduct funds from wallet"""
+        if not self.can_pay(amount):
+            raise ValidationError("Insufficient funds or wallet inactive")
+        
+        self.balance -= amount
+        self.save()
+        
+        # Record transaction
+        self.transactions.create(
+            transaction_type='debit',
+            amount=amount,
+            description=description,
+            balance_after=self.balance
+        )
+        return self.balance
 
-class Payout(models.Model):
-    STATUS_CHOICES = (
-        ('pending', 'Pending'),
-        ('processed', 'Processed'),
-        ('failed', 'Failed'),
+
+class WalletTransaction(models.Model):
+    """Records all wallet transactions"""
+    TRANSACTION_TYPES = (
+        ('credit', 'Credit'),
+        ('debit', 'Debit'),
     )
     
-    user = models.ForeignKey(User, on_delete=models.CASCADE, related_name='payouts')
-    amount = models.DecimalField(max_digits=10, decimal_places=2, validators=[MinValueValidator(0)])
-    currency = models.CharField(max_length=3, default='USD')
-    status = models.CharField(max_length=10, choices=STATUS_CHOICES, default='pending')
-    payout_method = models.CharField(max_length=50)
-    payout_reference = models.CharField(max_length=100, blank=True, null=True)
-    initiated_at = models.DateTimeField(auto_now_add=True)
-    processed_at = models.DateTimeField(blank=True, null=True)
+    wallet = models.ForeignKey(Wallet, on_delete=models.CASCADE, related_name='transactions')
+    transaction_type = models.CharField(max_length=10, choices=TRANSACTION_TYPES)
+    amount = models.DecimalField(max_digits=12, decimal_places=2)
+    description = models.TextField()
+    reference_id = models.CharField(max_length=100, blank=True)  # Links to external transaction
+    balance_after = models.DecimalField(max_digits=12, decimal_places=2)
+    
+    metadata = models.JSONField(default=dict, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
     
     class Meta:
-        ordering = ['-initiated_at']
+        ordering = ['-created_at']
     
     def __str__(self):
-        return f"Payout - {self.user.email} - {self.amount} {self.currency}"
+        return f"{self.wallet.user.email} - {self.transaction_type} {self.amount}"

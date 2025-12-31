@@ -1,640 +1,556 @@
-from rest_framework import status, permissions
-from rest_framework.decorators import api_view, permission_classes
-from rest_framework.response import Response
+from rest_framework import status, generics
 from rest_framework.views import APIView
-from django.contrib.auth import authenticate, login, logout
-from django.utils import timezone
-from .serializers import *
+from rest_framework.response import Response
+from rest_framework.permissions import IsAuthenticated, AllowAny
+from django.contrib.auth import get_user_model
+from django.db import transaction
+from .serializers import (
+    UserRegistrationSerializer, LoginSerializer, OTPRequestSerializer,
+    OTPVerifySerializer, SocialLoginSerializer, TokenRefreshSerializer,
+    UserProfileSerializer
+)
+from .models import UserSession
 from .supabase_service import supabase_auth
 from .sync_service import UserSyncService
 from backend.security.logging import SecurityLogger
 import logging
 
+User = get_user_model()
 logger = logging.getLogger(__name__)
-security_logger = SecurityLogger()
+SecurityLogger = logging.getLogger(__name__)
 
-class RegisterView(APIView):
+class UserRegistrationView(APIView):
     """
-    User registration endpoint
+    Register a new user with Supabase and local database
     """
-    permission_classes = [permissions.AllowAny]
+    permission_classes = [AllowAny]
     
     def post(self, request):
         serializer = UserRegistrationSerializer(data=request.data)
         
         if not serializer.is_valid():
-            return Response(
-                {'error': serializer.errors}, 
-                status=status.HTTP_400_BAD_REQUEST
-            )
+            return Response({
+                'success': False,
+                'errors': serializer.errors
+            }, status=status.HTTP_400_BAD_REQUEST)
         
         try:
-            # Register with Supabase
-            success, result = supabase_auth.register_user(
-                email=serializer.validated_data['email'],
-                password=serializer.validated_data['password'],
-                phone=serializer.validated_data.get('phone_number'),
-                metadata={
-                    'full_name': serializer.validated_data.get('full_name'),
-                    'user_type': serializer.validated_data.get('user_type'),
-                    'date_of_birth': serializer.validated_data.get('date_of_birth').isoformat() if serializer.validated_data.get('date_of_birth') else None
+            with transaction.atomic():
+                # Prepare metadata
+                metadata = {
+                    'full_name': serializer.validated_data.get('full_name', ''),
+                    'user_type': serializer.validated_data.get('user_type', 'rider'),
                 }
-            )
-            
-            if success:
-                # Create Django user
-                user = UserSyncService.sync_user_from_supabase(result)
                 
-                # Log registration
-                security_logger.log_auth_attempt(
-                    user_id=str(user.id),
-                    ip_address=UserSyncService.get_client_ip(request),
-                    success=True,
-                    method='registration'
+                # Create user in Supabase
+                success, supabase_data = supabase_auth.register_user(
+                    email=serializer.validated_data['email'],
+                    password=serializer.validated_data['password'],
+                    phone=serializer.validated_data.get('phone_number'),
+                    metadata=metadata
                 )
                 
-                return Response({
+                if not success:
+                    return Response({
+                        'success': False,
+                        'error': supabase_data.get('error', 'Registration failed')
+                    }, status=status.HTTP_400_BAD_REQUEST)
+                
+                # Create user in local database
+                user = User.objects.create(
+                    email=serializer.validated_data['email'],
+                    phone_number=serializer.validated_data.get('phone_number'),
+                    full_name=serializer.validated_data.get('full_name', ''),
+                    user_type=serializer.validated_data.get('user_type', 'rider'),
+                    date_of_birth=serializer.validated_data.get('date_of_birth'),
+                    supabase_uid=supabase_data['user_id'],
+                    is_email_verified=supabase_data.get('email_confirmed', False),
+                    is_phone_verified=supabase_data.get('phone_confirmed', False)
+                )
+                user.set_password(serializer.validated_data['password'])
+                user.save()
+                
+                # Log the user in to get tokens
+                login_success, login_data = supabase_auth.login_user(
+                    email=serializer.validated_data['email'],
+                    password=serializer.validated_data['password']
+                )
+                
+                # Create session if device info provided
+                if request.data.get('device_id') and login_success:
+                    UserSyncService.create_user_session(
+                        user=user,
+                        access_token=login_data.get('access_token'),
+                        refresh_token=login_data.get('refresh_token'),
+                        device_id=request.data.get('device_id'),
+                        platform=request.data.get('platform', 'web'),
+                        request=request
+                    )
+                
+                response_data = {
+                    'success': True,
                     'message': 'Registration successful. Please verify your email.',
-                    'user_id': result['user_id'],
-                    'email_confirmation_required': not result['email_confirmed']
-                }, status=status.HTTP_201_CREATED)
-            else:
-                return Response(
-                    {'error': result.get('error', 'Registration failed')},
-                    status=status.HTTP_400_BAD_REQUEST
-                )
+                    'user': UserProfileSerializer(user).data,
+                }
+                
+                if login_success:
+                    response_data['access_token'] = login_data.get('access_token')
+                    response_data['refresh_token'] = login_data.get('refresh_token')
+                
+                return Response(response_data, status=status.HTTP_201_CREATED)
                 
         except Exception as e:
             logger.error(f"Registration error: {str(e)}")
-            return Response(
-                {'error': 'Registration failed'},
-                status=status.HTTP_500_INTERNAL_SERVER_ERROR
-            )
+            return Response({
+                'success': False,
+                'error': str(e)
+            }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
 
 class LoginView(APIView):
     """
-    User login endpoint
+    Login with email/phone and password
     """
-    permission_classes = [permissions.AllowAny]
+    permission_classes = [AllowAny]
     
     def post(self, request):
         serializer = LoginSerializer(data=request.data)
         
         if not serializer.is_valid():
-            return Response(
-                {'error': serializer.errors},
-                status=status.HTTP_400_BAD_REQUEST
-            )
-        
-        username = serializer.validated_data['username']
-        password = serializer.validated_data['password']
+            return Response({
+                'success': False,
+                'errors': serializer.errors
+            }, status=status.HTTP_400_BAD_REQUEST)
         
         try:
-            # Check if user is locked
-            user = self.get_user_by_username(username)
-            if user and user.is_account_locked():
-                return Response(
-                    {'error': 'Account temporarily locked due to failed login attempts'},
-                    status=status.HTTP_423_LOCKED
+            username = serializer.validated_data['username']
+            password = serializer.validated_data['password']
+            
+            # Check if username is email or phone
+            user = None
+            success = False
+            auth_data = {}
+            
+            if '@' in username:
+                # Email login
+                user = User.objects.filter(email=username).first()
+                success, auth_data = supabase_auth.login_user(username, password)
+            else:
+                # Phone login
+                user = User.objects.filter(phone_number=username).first()
+                success, auth_data = supabase_auth.login_with_phone(username, password)
+            
+            if not success or not user:
+                return Response({
+                    'success': False,
+                    'error': auth_data.get('error', 'Invalid credentials')
+                }, status=status.HTTP_401_UNAUTHORIZED)
+            
+            # Update or create session
+            if serializer.validated_data.get('device_id'):
+                UserSyncService.create_user_session(
+                    user=user,
+                    access_token=auth_data.get('access_token'),
+                    refresh_token=auth_data.get('refresh_token'),
+                    device_id=serializer.validated_data['device_id'],
+                    platform=serializer.validated_data.get('platform', 'web'),
+                    request=request
                 )
             
-            # Authenticate with Django backend (which uses Supabase)
-            user = authenticate(request, username=username, password=password)
-            
-            if user:
-                # Login successful
-                login(request, user)
-                
-                # Create session record
-                session_data = {
-                    'session_id': request.session.session_key,
-                    'platform': serializer.validated_data.get('platform', 'web'),
-                    'device_id': serializer.validated_data.get('device_id'),
-                    'expires_in': 3600  # 1 hour
-                }
-                
-                UserSyncService.create_user_session(user, session_data, request)
-                
-                # Get fresh tokens from Supabase
-                success, tokens = supabase_auth.login_user(username, password)
-                
-                if success:
-                    response_data = {
-                        'message': 'Login successful',
-                        'user': UserProfileSerializer(user).data,
-                        'access_token': tokens['access_token'],
-                        'refresh_token': tokens['refresh_token'],
-                        'expires_at': tokens['expires_at']
-                    }
-                    
-                    # Check if 2FA is required
-                    if user.two_factor_enabled:
-                        response_data['requires_2fa'] = True
-                    
-                    # Log successful login
-                    security_logger.log_auth_attempt(
-                        user_id=str(user.id),
-                        ip_address=UserSyncService.get_client_ip(request),
-                        success=True,
-                        method='password'
-                    )
-                    
-                    return Response(response_data, status=status.HTTP_200_OK)
-            
-            # Login failed
-            security_logger.log_auth_attempt(
-                user_id=str(user.id) if user else None,
-                ip_address=UserSyncService.get_client_ip(request),
-                success=False,
-                method='password'
-            )
-            
-            return Response(
-                {'error': 'Invalid credentials'},
-                status=status.HTTP_401_UNAUTHORIZED
-            )
+            return Response({
+                'success': True,
+                'user': UserProfileSerializer(user).data,
+                'access_token': auth_data.get('access_token'),
+                'refresh_token': auth_data.get('refresh_token'),
+                'expires_at': auth_data.get('expires_at')
+            }, status=status.HTTP_200_OK)
             
         except Exception as e:
             logger.error(f"Login error: {str(e)}")
-            return Response(
-                {'error': 'Login failed'},
-                status=status.HTTP_500_INTERNAL_SERVER_ERROR
-            )
-    
-    def get_user_by_username(self, username):
-        """Get user by email or phone number"""
-        try:
-            return User.objects.get(email=username)
-        except User.DoesNotExist:
-            try:
-                return User.objects.get(phone_number=username)
-            except User.DoesNotExist:
-                return None
+            return Response({
+                'success': False,
+                'error': 'Invalid credentials'
+            }, status=status.HTTP_401_UNAUTHORIZED)
 
-class OTPRequestView(APIView):
-    """
-    Request OTP for phone authentication
-    """
-    permission_classes = [permissions.AllowAny]
-    
-    def post(self, request):
-        serializer = OTPRequestSerializer(data=request.data)
-        
-        if not serializer.is_valid():
-            return Response(
-                {'error': serializer.errors},
-                status=status.HTTP_400_BAD_REQUEST
-            )
-        
-        phone_number = serializer.validated_data['phone_number']
-        
-        try:
-            # Send OTP via Supabase
-            success, result = supabase_auth.send_otp(phone_number)
-            
-            if success:
-                return Response({
-                    'message': 'OTP sent successfully',
-                    'phone_number': phone_number
-                }, status=status.HTTP_200_OK)
-            else:
-                return Response(
-                    {'error': result.get('error', 'Failed to send OTP')},
-                    status=status.HTTP_400_BAD_REQUEST
-                )
-                
-        except Exception as e:
-            logger.error(f"OTP request error: {str(e)}")
-            return Response(
-                {'error': 'Failed to send OTP'},
-                status=status.HTTP_500_INTERNAL_SERVER_ERROR
-            )
-
-class OTPVerifyView(APIView):
-    """
-    Verify OTP and login user
-    """
-    permission_classes = [permissions.AllowAny]
-    
-    def post(self, request):
-        serializer = OTPVerifySerializer(data=request.data)
-        
-        if not serializer.is_valid():
-            return Response(
-                {'error': serializer.errors},
-                status=status.HTTP_400_BAD_REQUEST
-            )
-        
-        phone_number = serializer.validated_data['phone_number']
-        otp_code = serializer.validated_data['otp_code']
-        
-        try:
-            # Verify OTP with Supabase
-            success, result = supabase_auth.verify_otp(phone_number, otp_code)
-            
-            if success:
-                # Sync user with Django
-                user = UserSyncService.sync_user_from_supabase(result)
-                
-                # Login user
-                login(request, user)
-                
-                # Create session
-                session_data = {
-                    'session_id': request.session.session_key,
-                    'platform': serializer.validated_data.get('platform', 'mobile'),
-                    'device_id': serializer.validated_data.get('device_id'),
-                    'expires_in': 3600
-                }
-                
-                UserSyncService.create_user_session(user, session_data, request)
-                
-                # Log successful login
-                security_logger.log_auth_attempt(
-                    user_id=str(user.id),
-                    ip_address=UserSyncService.get_client_ip(request),
-                    success=True,
-                    method='otp'
-                )
-                
-                return Response({
-                    'message': 'OTP verification successful',
-                    'user': UserProfileSerializer(user).data,
-                    'access_token': result['access_token'],
-                    'refresh_token': result['refresh_token']
-                }, status=status.HTTP_200_OK)
-            
-            else:
-                # Log failed attempt
-                security_logger.log_auth_attempt(
-                    user_id=None,
-                    ip_address=UserSyncService.get_client_ip(request),
-                    success=False,
-                    method='otp'
-                )
-                
-                return Response(
-                    {'error': result.get('error', 'Invalid OTP')},
-                    status=status.HTTP_401_UNAUTHORIZED
-                )
-                
-        except Exception as e:
-            logger.error(f"OTP verification error: {str(e)}")
-            return Response(
-                {'error': 'OTP verification failed'},
-                status=status.HTTP_500_INTERNAL_SERVER_ERROR
-            )
 
 class SocialLoginView(APIView):
     """
-    Social media login endpoint
+    Social login with Google, Facebook, or Apple
     """
-    permission_classes = [permissions.AllowAny]
+    permission_classes = [AllowAny]
     
     def post(self, request):
         serializer = SocialLoginSerializer(data=request.data)
         
         if not serializer.is_valid():
-            return Response(
-                {'error': serializer.errors},
-                status=status.HTTP_400_BAD_REQUEST
-            )
-        
-        provider = serializer.validated_data['provider']
-        access_token = serializer.validated_data['access_token']
+            return Response({
+                'success': False,
+                'errors': serializer.errors
+            }, status=status.HTTP_400_BAD_REQUEST)
         
         try:
-            # Verify social token and get user info
-            user_info = self.verify_social_token(provider, access_token)
+            provider = serializer.validated_data['provider']
+            redirect_url = f"{request.scheme}://{request.get_host()}/api/auth/social/callback/"
             
-            if not user_info:
-                return Response(
-                    {'error': 'Invalid social media token'},
-                    status=status.HTTP_401_UNAUTHORIZED
-                )
+            # Get OAuth URL from Supabase
+            oauth_url = supabase_auth.social_login(provider, redirect_url)
             
-            # Check if user exists
-            user = self.get_or_create_social_user(provider, user_info)
-            
-            if user:
-                # Login user
-                login(request, user)
-                
-                # Create session
-                session_data = {
-                    'session_id': request.session.session_key,
-                    'platform': serializer.validated_data.get('platform', 'mobile'),
-                    'device_id': serializer.validated_data.get('device_id'),
-                    'expires_in': 3600
-                }
-                
-                UserSyncService.create_user_session(user, session_data, request)
-                
-                # Generate JWT tokens
-                # (You might want to create your own JWT or use Supabase's social auth)
-                
-                # Log successful login
-                security_logger.log_auth_attempt(
-                    user_id=str(user.id),
-                    ip_address=UserSyncService.get_client_ip(request),
-                    success=True,
-                    method=f'social_{provider}'
-                )
-                
+            if not oauth_url:
                 return Response({
-                    'message': 'Social login successful',
-                    'user': UserProfileSerializer(user).data,
-                    'access_token': 'generated_jwt_token',  # Replace with actual token
-                    'is_new_user': getattr(user, '_is_new_user', False)
-                }, status=status.HTTP_200_OK)
+                    'success': False,
+                    'error': 'Failed to generate OAuth URL'
+                }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
             
-            else:
-                return Response(
-                    {'error': 'Social login failed'},
-                    status=status.HTTP_400_BAD_REQUEST
-                )
-                
+            return Response({
+                'success': True,
+                'provider': provider,
+                'url': oauth_url
+            }, status=status.HTTP_200_OK)
+            
         except Exception as e:
             logger.error(f"Social login error: {str(e)}")
-            return Response(
-                {'error': 'Social login failed'},
-                status=status.HTTP_500_INTERNAL_SERVER_ERROR
-            )
+            return Response({
+                'success': False,
+                'error': str(e)
+            }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+
+class SocialAuthCallbackView(APIView):
+    """
+    Handle OAuth callback from social providers
+    """
+    permission_classes = [AllowAny]
     
-    def verify_social_token(self, provider, access_token):
-        """Verify social media access token and get user info"""
-        import requests
-        
+    def get(self, request):
         try:
-            if provider == 'google':
-                response = requests.get(
-                    f'https://www.googleapis.com/oauth2/v2/userinfo?access_token={access_token}'
+            access_token = request.GET.get('access_token')
+            refresh_token = request.GET.get('refresh_token')
+            error = request.GET.get('error')
+            
+            if error:
+                return Response({
+                    'success': False,
+                    'error': error
+                }, status=status.HTTP_400_BAD_REQUEST)
+            
+            if not access_token:
+                return Response({
+                    'success': False,
+                    'error': 'No access token received'
+                }, status=status.HTTP_400_BAD_REQUEST)
+            
+            # Verify token and get user info
+            token_valid, token_data = supabase_auth.verify_token(access_token)
+            
+            if not token_valid:
+                return Response({
+                    'success': False,
+                    'error': 'Invalid token'
+                }, status=status.HTTP_401_UNAUTHORIZED)
+            
+            # Sync user from token data
+            sync_data = {
+                'user_id': token_data.get('user_id'),
+                'email': token_data.get('email'),
+                'phone': token_data.get('phone'),
+                'user_metadata': {},
+                'email_confirmed': bool(token_data.get('email')),
+                'phone_confirmed': bool(token_data.get('phone') and not token_data.get('email')),
+            }
+            
+            user = UserSyncService.sync_user_from_supabase(sync_data)
+            created = not User.objects.filter(supabase_uid=token_data.get('user_id')).exists()
+            
+            # Create session if device info provided
+            device_id = request.GET.get('device_id')
+            if device_id and access_token:
+                UserSyncService.create_user_session(
+                    user=user,
+                    access_token=access_token,
+                    refresh_token=refresh_token,
+                    device_id=device_id,
+                    platform=request.GET.get('platform', 'web'),
+                    request=request
                 )
-                if response.status_code == 200:
-                    data = response.json()
-                    return {
-                        'id': data.get('id'),
-                        'email': data.get('email'),
-                        'name': data.get('name'),
-                        'picture': data.get('picture'),
-                        'verified_email': data.get('verified_email', False)
-                    }
             
-            elif provider == 'facebook':
-                response = requests.get(
-                    f'https://graph.facebook.com/me?fields=id,name,email,picture&access_token={access_token}'
-                )
-                if response.status_code == 200:
-                    data = response.json()
-                    return {
-                        'id': data.get('id'),
-                        'email': data.get('email'),
-                        'name': data.get('name'),
-                        'picture': data.get('picture', {}).get('data', {}).get('url'),
-                        'verified_email': True  # Facebook emails are typically verified
-                    }
-            
-            elif provider == 'apple':
-                # Apple Sign-In requires JWT verification
-                # This is more complex and requires Apple's public keys
-                # For now, returning None - implement based on your needs
-                pass
-                
-        except Exception as e:
-            logger.error(f"Social token verification error: {str(e)}")
-        
-        return None
-    
-    def get_or_create_social_user(self, provider, user_info):
-        """Get or create user from social media info"""
-        try:
-            social_id = user_info.get('id')
-            email = user_info.get('email')
-            
-            # Try to find existing user by social ID
-            social_id_field = f'{provider}_id'
-            filter_kwargs = {social_id_field: social_id}
-            
-            try:
-                user = User.objects.get(**filter_kwargs)
-                return user
-            except User.DoesNotExist:
-                pass
-            
-            # Try to find by email
-            if email:
-                try:
-                    user = User.objects.get(email=email)
-                    # Update social ID
-                    setattr(user, social_id_field, social_id)
-                    user.save()
-                    return user
-                except User.DoesNotExist:
-                    pass
-            
-            # Create new user
-            if email:
-                user_data = {
-                    'username': email,
-                    'email': email,
-                    'full_name': user_info.get('name', ''),
-                    'profile_picture': user_info.get('picture', ''),
-                    'is_email_verified': user_info.get('verified_email', False),
-                    social_id_field: social_id
-                }
-                
-                user = User.objects.create_user(**user_data)
-                user._is_new_user = True  # Flag for frontend
-                
-                return user
+            return Response({
+                'success': True,
+                'user': UserProfileSerializer(user).data,
+                'access_token': access_token,
+                'refresh_token': refresh_token,
+                'is_new_user': created
+            }, status=status.HTTP_200_OK)
             
         except Exception as e:
-            logger.error(f"Social user creation error: {str(e)}")
+            logger.error(f"Social auth callback error: {str(e)}")
+            return Response({
+                'success': False,
+                'error': str(e)
+            }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+
+class OTPRequestView(APIView):
+    """
+    Request OTP for phone verification
+    """
+    permission_classes = [AllowAny]
+    
+    def post(self, request):
+        serializer = OTPRequestSerializer(data=request.data)
         
-        return None
+        if not serializer.is_valid():
+            return Response({
+                'success': False,
+                'errors': serializer.errors
+            }, status=status.HTTP_400_BAD_REQUEST)
+        
+        try:
+            phone_number = serializer.validated_data['phone_number']
+            
+            # Send OTP via Supabase
+            success, result = supabase_auth.send_otp(phone_number)
+            
+            if not success:
+                return Response({
+                    'success': False,
+                    'error': result.get('error', 'Failed to send OTP')
+                }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+            
+            return Response({
+                'success': True,
+                'message': 'OTP sent successfully'
+            }, status=status.HTTP_200_OK)
+            
+        except Exception as e:
+            logger.error(f"OTP request error: {str(e)}")
+            return Response({
+                'success': False,
+                'error': str(e)
+            }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+
+class OTPVerifyView(APIView):
+    """
+    Verify OTP and login/register user
+    """
+    permission_classes = [AllowAny]
+    
+    def post(self, request):
+        serializer = OTPVerifySerializer(data=request.data)
+        
+        if not serializer.is_valid():
+            return Response({
+                'success': False,
+                'errors': serializer.errors
+            }, status=status.HTTP_400_BAD_REQUEST)
+        
+        try:
+            phone_number = serializer.validated_data['phone_number']
+            otp_code = serializer.validated_data['otp_code']
+            
+            # Verify OTP with Supabase
+            success, auth_data = supabase_auth.verify_otp(phone_number, otp_code)
+            
+            if not success:
+                return Response({
+                    'success': False,
+                    'error': auth_data.get('error', 'Invalid or expired OTP')
+                }, status=status.HTTP_401_UNAUTHORIZED)
+            
+            # Sync user from auth data
+            sync_data = {
+                'user_id': auth_data['user_id'],
+                'phone': phone_number,
+                'phone_confirmed': True,
+                'user_metadata': {},
+            }
+            
+            # Check if user is new
+            user_exists = User.objects.filter(phone_number=phone_number).exists()
+            user = UserSyncService.sync_user_from_supabase(sync_data)
+            created = not user_exists
+            
+            # Create session if device info provided
+            if serializer.validated_data.get('device_id'):
+                UserSyncService.create_user_session(
+                    user=user,
+                    access_token=auth_data.get('access_token'),
+                    refresh_token=auth_data.get('refresh_token'),
+                    device_id=serializer.validated_data['device_id'],
+                    platform=serializer.validated_data.get('platform', 'web'),
+                    request=request
+                )
+            
+            return Response({
+                'success': True,
+                'user': UserProfileSerializer(user).data,
+                'access_token': auth_data.get('access_token'),
+                'refresh_token': auth_data.get('refresh_token'),
+                'is_new_user': created
+            }, status=status.HTTP_200_OK)
+            
+        except Exception as e:
+            logger.error(f"OTP verify error: {str(e)}")
+            return Response({
+                'success': False,
+                'error': 'Invalid or expired OTP'
+            }, status=status.HTTP_401_UNAUTHORIZED)
+
 
 class TokenRefreshView(APIView):
     """
-    Refresh JWT token
+    Refresh access token using refresh token
     """
-    permission_classes = [permissions.AllowAny]
+    permission_classes = [AllowAny]
     
     def post(self, request):
         serializer = TokenRefreshSerializer(data=request.data)
         
         if not serializer.is_valid():
-            return Response(
-                {'error': serializer.errors},
-                status=status.HTTP_400_BAD_REQUEST
-            )
-        
-        refresh_token = serializer.validated_data['refresh_token']
+            return Response({
+                'success': False,
+                'errors': serializer.errors
+            }, status=status.HTTP_400_BAD_REQUEST)
         
         try:
-            # Refresh token with Supabase
-            success, result = supabase_auth.refresh_token(refresh_token)
+            refresh_token = serializer.validated_data['refresh_token']
             
-            if success:
+            # Refresh token with Supabase
+            success, token_data = supabase_auth.refresh_token(refresh_token)
+            
+            if not success:
                 return Response({
-                    'access_token': result['access_token'],
-                    'refresh_token': result['refresh_token'],
-                    'expires_at': result['expires_at']
-                }, status=status.HTTP_200_OK)
-            else:
-                return Response(
-                    {'error': result.get('error', 'Token refresh failed')},
-                    status=status.HTTP_401_UNAUTHORIZED
+                    'success': False,
+                    'error': token_data.get('error', 'Invalid refresh token')
+                }, status=status.HTTP_401_UNAUTHORIZED)
+            
+            # Update session in database
+            updated_sessions = 0
+            sessions = UserSession.objects.filter(refresh_token=refresh_token)
+            for session in sessions:
+                UserSyncService.update_user_session(
+                    user=session.user,
+                    device_id=session.device_id,
+                    refresh_token=token_data.get('refresh_token')
                 )
-                
+                updated_sessions += 1
+            
+            logger.info(f"Updated {updated_sessions} session(s) with new refresh token")
+            
+            return Response({
+                'success': True,
+                'access_token': token_data.get('access_token'),
+                'refresh_token': token_data.get('refresh_token'),
+                'expires_at': token_data.get('expires_at')
+            }, status=status.HTTP_200_OK)
+            
         except Exception as e:
             logger.error(f"Token refresh error: {str(e)}")
-            return Response(
-                {'error': 'Token refresh failed'},
-                status=status.HTTP_500_INTERNAL_SERVER_ERROR
-            )
+            return Response({
+                'success': False,
+                'error': 'Invalid refresh token'
+            }, status=status.HTTP_401_UNAUTHORIZED)
+
 
 class LogoutView(APIView):
     """
-    User logout endpoint
+    Logout user and invalidate session
     """
-    permission_classes = [permissions.IsAuthenticated]
+    permission_classes = [IsAuthenticated]
     
     def post(self, request):
         try:
             # Get access token from header
-            auth_header = request.META.get('HTTP_AUTHORIZATION')
-            access_token = None
-            
-            if auth_header and auth_header.startswith('Bearer '):
-                access_token = auth_header[7:]
-            
-            # Logout from Supabase
-            if access_token:
+            auth_header = request.headers.get('Authorization', '')
+            if auth_header.startswith('Bearer '):
+                access_token = auth_header.split(' ')[1]
                 supabase_auth.logout_user(access_token)
             
-            # Invalidate Django session
-            UserSyncService.invalidate_user_sessions(request.user)
-            logout(request)
-            
-            # Log logout
-            security_logger.log_auth_attempt(
-                user_id=str(request.user.id),
-                ip_address=UserSyncService.get_client_ip(request),
-                success=True,
-                method='logout'
-            )
+            # Deactivate sessions
+            device_id = request.data.get('device_id')
+            UserSyncService.invalidate_user_sessions(request.user, device_id)
             
             return Response({
-                'message': 'Logout successful'
+                'success': True,
+                'message': 'Logged out successfully'
             }, status=status.HTTP_200_OK)
             
         except Exception as e:
             logger.error(f"Logout error: {str(e)}")
-            return Response(
-                {'error': 'Logout failed'},
-                status=status.HTTP_500_INTERNAL_SERVER_ERROR
-            )
+            return Response({
+                'success': False,
+                'error': str(e)
+            }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
-class ProfileView(APIView):
-    """
-    User profile management
-    """
-    permission_classes = [permissions.IsAuthenticated]
-    
-    def get(self, request):
-        """Get user profile"""
-        serializer = UserProfileSerializer(request.user)
-        return Response(serializer.data)
-    
-    def put(self, request):
-        """Update user profile"""
-        serializer = UserProfileSerializer(
-            request.user, 
-            data=request.data, 
-            partial=True
-        )
-        
-        if serializer.is_valid():
-            user = serializer.save()
-            
-            # Update Supabase metadata if needed
-            if user.supabase_uid:
-                metadata = {
-                    'full_name': user.full_name,
-                    'user_type': user.user_type,
-                    'profile_picture': user.profile_picture
-                }
-                supabase_auth.update_user_metadata(user.supabase_uid, metadata)
-            
-            # Log profile update
-            security_logger.log_data_access(
-                user_id=str(user.id),
-                resource='user_profile',
-                action='update'
-            )
-            
-            return Response(serializer.data)
-        
-        return Response(
-            {'error': serializer.errors},
-            status=status.HTTP_400_BAD_REQUEST
-        )
 
-class ChangePasswordView(APIView):
+class UserProfileView(generics.RetrieveUpdateAPIView):
     """
-    Change user password
+    Get and update user profile
     """
-    permission_classes = [permissions.IsAuthenticated]
+    serializer_class = UserProfileSerializer
+    permission_classes = [IsAuthenticated]
     
-    def post(self, request):
-        current_password = request.data.get('current_password')
-        new_password = request.data.get('new_password')
+    def get_object(self):
+        return self.request.user
+    
+    def update(self, request, *args, **kwargs):
+        partial = kwargs.pop('partial', False)
+        instance = self.get_object()
+        serializer = self.get_serializer(instance, data=request.data, partial=partial)
         
-        if not current_password or not new_password:
-            return Response(
-                {'error': 'Both current and new passwords are required'},
-                status=status.HTTP_400_BAD_REQUEST
-            )
+        if not serializer.is_valid():
+            return Response({
+                'success': False,
+                'errors': serializer.errors
+            }, status=status.HTTP_400_BAD_REQUEST)
         
-        # Verify current password
-        user = authenticate(
-            username=request.user.email,
-            password=current_password
-        )
+        self.perform_update(serializer)
         
-        if not user:
-            return Response(
-                {'error': 'Current password is incorrect'},
-                status=status.HTTP_400_BAD_REQUEST
-            )
+        # Update Supabase metadata if needed
+        if instance.supabase_uid:
+            metadata = {
+                'full_name': instance.full_name,
+                'user_type': instance.user_type,
+            }
+            supabase_auth.update_user_metadata(instance.supabase_uid, metadata)
         
+        return Response({
+            'success': True,
+            'user': serializer.data
+        }, status=status.HTTP_200_OK)
+
+
+class DeleteAccountView(APIView):
+    """
+    Delete user account from both local DB and Supabase
+    """
+    permission_classes = [IsAuthenticated]
+    
+    def delete(self, request):
         try:
-            # Update password in Supabase
-            # Note: Supabase doesn't have direct password update API
-            # You might need to use password reset flow or admin API
+            user = request.user
             
-            # For now, we'll update Django password
-            user.set_password(new_password)
-            user.save()
+            # Get access token
+            auth_header = request.headers.get('Authorization', '')
+            if auth_header.startswith('Bearer '):
+                access_token = auth_header.split(' ')[1]
+                supabase_auth.logout_user(access_token)
             
-            # Invalidate all sessions for security
+            # Delete all sessions
             UserSyncService.invalidate_user_sessions(user)
+            UserSession.objects.filter(user=user).delete()
             
-            # Log password change
-            security_logger.log_data_access(
-                user_id=str(user.id),
-                resource='user_password',
-                action='change',
-                sensitive=True
-            )
+            # Delete user from local database
+            user.delete()
             
             return Response({
-                'message': 'Password changed successfully. Please log in again.'
-            })
+                'success': True,
+                'message': 'Account deleted successfully'
+            }, status=status.HTTP_200_OK)
             
         except Exception as e:
-            logger.error(f"Password change error: {str(e)}")
-            return Response(
-                {'error': 'Password change failed'},
-                status=status.HTTP_500_INTERNAL_SERVER_ERROR
-            )
+            logger.error(f"Account deletion error: {str(e)}")
+            return Response({
+                'success': False,
+                'error': str(e)
+            }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
