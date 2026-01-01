@@ -5,7 +5,7 @@ import Input from '../../components/common/Input'
 import Button from '../../components/common/Button'
 import { authService } from '../../services/auth.service'
 
-export default function Register() {
+export function Register() {
   const navigate = useNavigate()
   const [formData, setFormData] = useState({
     firstName: '',

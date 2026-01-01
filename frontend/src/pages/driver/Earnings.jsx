@@ -3,7 +3,7 @@ import { DollarSign, TrendingUp, Calendar } from 'lucide-react'
 import Header from '../../components/layout/Header'
 import Card from '../../components/common/Card'
 
-export default function Earnings() {
+export function Earnings() {
   const [period, setPeriod] = useState('week')
 
   return (

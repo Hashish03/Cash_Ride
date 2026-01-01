@@ -9,7 +9,7 @@ import { useRideStore } from '../../store/rideStore'
 import { rideService } from '../../services/ride.service'
 import { formatCurrency } from '../../utils/helpers'
 
-export default function BookRide() {
+export function BookRide() {
   const navigate = useNavigate()
   const { pickupLocation, dropoffLocation, setPickupLocation, setDropoffLocation } = useLocationStore()
   const { setCurrentRide } = useRideStore()

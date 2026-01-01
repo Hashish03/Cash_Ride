@@ -2,22 +2,21 @@ import { BrowserRouter as Router, Routes, Route, Navigate } from 'react-router-d
 import { useAuthStore } from './store/authStore'
 
 // Auth Pages
-import Login from './pages/auth/Login'
-import Register from './pages/auth/Register'
+import { Login } from './pages/auth/Login'
+import { Register } from './pages/auth/Register'
 
 // Passenger Pages
-import PassengerHome from './pages/passenger/Home'
-import BookRide from './pages/passenger/BookRide'
-import RideTracking from './pages/passenger/RideTracking'
-import PassengerProfile from './pages/passenger/Profile'
+import { PassengerHome } from './pages/passenger/Home'
+import { BookRide } from './pages/passenger/BookRide'
+import { RideTracking } from './pages/passenger/RideTracking'
+import { PassengerProfile } from './pages/passenger/Profile'
 
 // Driver Pages
-import DriverDashboard from './pages/driver/Dashboard'
-import AcceptRide from './pages/driver/AcceptRide'
-import Earnings from './pages/driver/Earnings'
+import { DriverDashboard } from './pages/driver/Dashboard'
+import { AcceptRide } from './pages/driver/AcceptRide'
+import { Earnings } from './pages/driver/Earnings'
 
-// Other
-import NotFound from './pages/NotFound'
+
 
 // Protected Route Component
 const ProtectedRoute = ({ children, allowedRoles }) => {
@@ -34,7 +33,7 @@ const ProtectedRoute = ({ children, allowedRoles }) => {
   return children
 }
 
-function App() {
+export default function App() {
   return (
     <Router>
       <Routes>
@@ -102,11 +101,8 @@ function App() {
           }
         />
 
-        {/* 404 */}
-        <Route path="*" element={<NotFound />} />
+        
       </Routes>
     </Router>
   )
 }
-
-export default App

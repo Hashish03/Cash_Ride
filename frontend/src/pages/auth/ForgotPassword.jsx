@@ -4,7 +4,7 @@ import { Mail, ArrowLeft } from 'lucide-react'
 import Input from '../../components/common/Input'
 import Button from '../../components/common/Button'
 
-export default function ForgotPassword() {
+export function ForgotPassword() {
   const [email, setEmail] = useState('')
   const [loading, setLoading] = useState(false)
   const [success, setSuccess] = useState(false)

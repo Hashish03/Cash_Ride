@@ -5,7 +5,7 @@ import Card from '../../components/common/Card'
 import Button from '../../components/common/Button'
 import { useAuth } from '../../hooks/useAuth'
 
-export default function DriverDashboard() {
+export function DriverDashboard() {
   const { user } = useAuth()
   const [isOnline, setIsOnline] = useState(false)
   const [todayEarnings, setTodayEarnings] = useState(0)

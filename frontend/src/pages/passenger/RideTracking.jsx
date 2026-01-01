@@ -10,7 +10,7 @@ import { rideService } from '../../services/ride.service'
 import { useSocket } from '../../hooks/useSocket'
 import { RIDE_STATUS } from '../../utils/constants'
 
-export default function RideTracking() {
+export function RideTracking() {
   const { rideId } = useParams()
   const navigate = useNavigate()
   const socket = useSocket()

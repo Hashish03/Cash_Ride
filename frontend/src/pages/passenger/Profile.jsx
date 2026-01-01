@@ -7,7 +7,7 @@ import Card from '../../components/common/Card'
 import { useAuth } from '../../hooks/useAuth'
 import { authService } from '../../services/auth.service'
 
-export default function Profile() {
+export function PassengerProfile () {
   const { user, updateUser } = useAuth()
   const [formData, setFormData] = useState({
     firstName: '',

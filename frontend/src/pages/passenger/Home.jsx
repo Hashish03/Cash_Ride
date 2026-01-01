@@ -7,7 +7,7 @@ import RideHistory from '../../components/ride/RideHistory'
 import { useRideStore } from '../../store/rideStore'
 import { useGeolocation } from '../../hooks/useGeolocation'
 
-export default function PassengerHome() {
+export function PassengerHome() {
   const navigate = useNavigate()
   const { currentRide } = useRideStore()
   const { currentLocation } = useGeolocation()

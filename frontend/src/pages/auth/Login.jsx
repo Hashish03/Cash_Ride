@@ -5,7 +5,7 @@ import Input from '../../components/common/Input'
 import Button from '../../components/common/Button'
 import { useAuth } from '../../hooks/useAuth'
 
-export default function Login() {
+export function Login() {
   const navigate = useNavigate()
   const { login } = useAuth()
   const [formData, setFormData] = useState({

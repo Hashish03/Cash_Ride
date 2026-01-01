@@ -6,7 +6,7 @@ import Button from '../../components/common/Button'
 import MapView from '../../components/maps/MapView'
 import { rideService } from '../../services/ride.service'
 
-export default function AcceptRide() {
+export function AcceptRide() {
   const { rideId } = useParams()
   const navigate = useNavigate()
   const [ride, setRide] = useState(null)
